@@ -173,9 +173,13 @@ def populate_episode_metadata_from_info_json_optimized(series_root_folder, filen
         Log.Info(u'Erstelle JSON-Cache fuer Verzeichnis: {}'.format(os.path.basename(series_root_folder)))
         cache_start = time.time()
         
-        # Verwende glob für schnelle Suche (viel schneller als os.walk)
-        pattern = os.path.join(series_root_folder, "**/*.info.json")
-        json_files = glob.glob(pattern, recursive=True)
+        
+        json_files = []
+        for root, _, files in os.walk(series_root_folder):
+            for f in files:
+                if f.endswith(".info.json"):
+                    json_files.append(os.path.join(root, f))
+
         
         # Erstelle Mapping: Dateiname -> Vollständiger Pfad
         JSON_FILE_CACHE[cache_key] = {}
@@ -725,13 +729,20 @@ def Update(metadata, media, lang, force, movie):
           # videoId in Playlist/channel
           videoId = Dict(video, 'id', 'videoId') or Dict(video, 'snippet', 'resourceId', 'videoId')
           if videoId and videoId in filename:
-            episode.title                   = sanitize_path(Dict(video, 'snippet', 'title'       ));                                                                  Log.Info(u'[ ] title:        {}'.format(Dict(video, 'snippet', 'title'       )))
-            episode.summary                 = sanitize_path(Dict(video, 'snippet', 'description' ));                                                                  Log.Info(u'[ ] description:  {}'.format(Dict(video, 'snippet', 'description' ).replace('\n', '. ')))
-            episode.originally_available_at = Datetime.ParseDate(Dict(video, 'contentDetails', 'videoPublishedAt') or Dict(video, 'snippet', 'publishedAt')).date();  Log.Info('[ ] publishedAt:  {}'.format(Dict(video, 'contentDetails', 'videoPublishedAt' )))
-            thumb                           = Dict(video, 'snippet', 'thumbnails', 'maxres', 'url') or Dict(video, 'snippet', 'thumbnails', 'medium', 'url')or Dict(video, 'snippet', 'thumbnails', 'standard', 'url') or Dict(video, 'snippet', 'thumbnails', 'high', 'url') or Dict(video, 'snippet', 'thumbnails', 'default', 'url')
-            if thumb and thumb not in episode.thumbs:  episode.thumbs[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1);                                Log.Info('[ ] thumbnail:    {}'.format(thumb))
+            title_api = Dict(video, 'snippet', 'title')
+            if title_api.lower() in ('private video', 'deleted video', 'video unavailable', ''):
+                Log.Info(u'Skippe Platzhalter-Titel – verwende lokale info.json')
+                continue
+            episode.title                   = sanitize_path(title_api)
+            episode.summary                 = sanitize_path(Dict(video, 'snippet', 'description').replace('\n', '. '))
+            episode.originally_available_at = Datetime.ParseDate(Dict(video, 'snippet', 'publishedAt')).date()
+            thumb                           = Dict(video, 'snippet', 'thumbnails', 'high', 'url') or Dict(video, 'snippet', 'thumbnails', 'default', 'url')
+            if thumb and thumb not in episode.thumbs:
+                episode.thumbs[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+                episode.thumbs.validate_keys([thumb])
             Log.Info(u'[ ] channelTitle: {}'.format(Dict(video, 'snippet', 'channelTitle')))
             break
+
         
         else:  # videoId not in Playlist/channel item list
 
