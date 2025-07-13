@@ -275,16 +275,43 @@ def Search(results, media, lang, manual, movie):
         return
     
   try:
-    for regex, url in [('PLAYLIST', YOUTUBE_PLAYLIST_REGEX), ('CHANNEL', YOUTUBE_CHANNEL_REGEX), ('VIDEO', YOUTUBE_VIDEO_REGEX)]:
-      result = url.search(filename)
+    # 1. Suche zuerst im Ordnernamen (für Channel-IDs)
+    dir_basename = os.path.basename(dir)
+    for regex, url in [('PLAYLIST', YOUTUBE_PLAYLIST_REGEX), ('CHANNEL', YOUTUBE_CHANNEL_REGEX)]:
+      result = url.search(dir_basename)  # ✅ Sucht in Ordnername
       if result:
         guid = result.group('id')
-        Log.Info(u'search() - YouTube ID found - regex: {}, youtube ID: "{}"'.format(regex, guid))
-        results.Append( MetadataSearchResult( id='youtube|{}|{}'.format(guid,os.path.basename(dir)), name=displayname, year=None, score=100, lang=lang ) )
+        # Bereinige Serienname (entferne Channel-ID aus Name)
+        clean_name = re.sub(r'\[UC[a-zA-Z0-9\-_]{22,23}\]', '', dir_basename).strip()
+        Log.Info(u'search() - YouTube ID found in folder - regex: {}, youtube ID: "{}", clean name: "{}"'.format(regex, guid, clean_name))
+        results.Append( MetadataSearchResult( 
+          id='youtube|{}|{}'.format(guid, os.path.basename(dir)), 
+          name=clean_name or displayname, 
+          year=None, score=100, lang=lang 
+        ))
         Log(u''.ljust(157, '='))
         return
-      else: Log.Info('search() - YouTube ID not found - regex: "{}"'.format(regex))  
-  except Exception as e:  Log('search() - filename: "{}" Regex failed to find YouTube id, error: "{}"'.format(filename, e))
+      else: 
+        Log.Info('search() - YouTube ID not found in folder - regex: "{}"'.format(regex))
+    
+    # 2. Fallback: Suche im Dateinamen (für Video-IDs)
+    for regex, url in [('VIDEO', YOUTUBE_VIDEO_REGEX)]:
+      result = url.search(filename)  # Sucht in filename für Video-IDs
+      if result:
+        guid = result.group('id')
+        Log.Info(u'search() - YouTube ID found in filename - regex: {}, youtube ID: "{}"'.format(regex, guid))
+        results.Append( MetadataSearchResult( 
+          id='youtube|{}|{}'.format(guid, os.path.basename(dir)), 
+          name=displayname, 
+          year=None, score=100, lang=lang 
+        ))
+        Log(u''.ljust(157, '='))
+        return
+      else: 
+        Log.Info('search() - YouTube ID not found in filename - regex: "{}"'.format(regex))
+        
+  except Exception as e:  
+    Log('search() - Error searching for YouTube ID, error: "{}"'.format(e))
   
   ### FALLBACK FOR S1_FORMAT ###
   try:
@@ -333,8 +360,17 @@ def Search(results, media, lang, manual, movie):
   except Exception as e:  Log(u'search() - Could not retrieve data from YouTube for: "{}", Exception: "{}"'.format(filename, e))
 
   library, root, path = GetLibraryRootPath(dir)
-  Log(u'Putting folder name "{}" as guid since no assign channel id or playlist id was assigned'.format(path.split(os.sep)[-1]))
-  results.Append( MetadataSearchResult( id='youtube|{}|{}'.format(path.split(os.sep)[-2] if os.sep in path else '', dir), name=os.path.basename(filename), year=None, score=80, lang=lang ) )
+  # VERBESSERT: Extrahiere sauberen Seriennamen aus Ordnerpfad
+  series_name = os.path.basename(dir)  # Verwende Ordnername statt Dateiname
+  series_name = re.sub(r'\[.*?\]', '', series_name).strip()  # Entferne alle [xxx] Tags
+  series_name = re.sub(r'\s+', ' ', series_name).strip()     # Bereinige Leerzeichen
+
+  Log(u'Putting folder name "{}" as guid since no assign channel id or playlist id was assigned'.format(series_name))
+  results.Append( MetadataSearchResult( 
+    id='youtube|{}|{}'.format(path.split(os.sep)[-2] if os.sep in path else '', dir), 
+    name=series_name if series_name else displayname,  # Verwende bereinigten Ordnernamen
+    year=None, score=80, lang=lang 
+  ))
   Log(''.ljust(157, '='))
 
 ### Download metadata using unique ID ###
@@ -350,7 +386,12 @@ def Update(metadata, media, lang, force, movie):
   json_channel_details       = {}
   json_video_details         = {}
   series_folder              = sanitize_path(series_folder)
-  if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')):  metadata.title = re.sub(r'\[.*\]', '', dir).strip()  #no id mode, update title so ep gets updated
+  if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')):  
+    # VERBESSERT: Verwende nur den Ordnernamen, nicht den vollständigen Pfad
+    folder_name = os.path.basename(dir)
+    clean_title = re.sub(r'\[.*?\]', '', folder_name).strip()
+    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+    metadata.title = clean_title if clean_title else folder_name
   Log(u''.ljust(157, '='))
     
   ### Movie Library ###
@@ -714,6 +755,31 @@ def Update(metadata, media, lang, force, movie):
     genre_array = {}
     episodes    = 0
 
+    # WICHTIG: Extrahiere Channel-Titel aus erster JSON-Datei für Serientitel
+    if not metadata.title or os.sep in metadata.title or '[UC' in metadata.title:
+        first_json_channel_title = ""
+        list_files = os.listdir(series_root_folder) if os.path.exists(series_root_folder) else []
+        for file in sorted(list_files):
+            if file.endswith(".info.json"):
+                try:
+                    json_content = JSON.ObjectFromString(Core.storage.load(os.path.join(series_root_folder, file)))
+                    first_json_channel_title = Dict(json_content, 'uploader') or Dict(json_content, 'channel')
+                    if first_json_channel_title:
+                        Log.Info(u'[ ] Channel-Titel aus JSON extrahiert: "{}" (aus: {})'.format(first_json_channel_title, file))
+                        break
+                except:
+                    continue
+        
+        if first_json_channel_title:
+            metadata.title = sanitize_path(first_json_channel_title)
+            Log.Info(u'[ ] Serientitel aus erster JSON gesetzt: "{}"'.format(metadata.title))
+        else:
+            # Fallback: Ordnername ohne Channel-ID
+            folder_name = os.path.basename(dir)
+            clean_title = re.sub(r'\[UC[a-zA-Z0-9\-_]{22,23}\]', '', folder_name).strip()
+            metadata.title = clean_title if clean_title else folder_name
+            Log.Info(u'[ ] Serientitel aus Ordnername gesetzt: "{}"'.format(metadata.title))
+
     for s in sorted(media.seasons, key=natural_sort_key):
       Log.Info(u"".ljust(157, '='))
       Log.Info(u"Season: {:>2}".format(s))
@@ -760,6 +826,11 @@ def Update(metadata, media, lang, force, movie):
             if json_channel_title and not channel_title:
               channel_title = sanitize_path(json_channel_title)
               Log.Info(u'[ ] channel aus JSON: "{}"'.format(channel_title))
+            
+            # FIX: Verwende extrahierten Channel-Titel auch für Serientitel
+            if channel_title and (not metadata.title or os.sep in metadata.title or '[UC' in metadata.title):
+                metadata.title = channel_title
+                Log.Info(u'[ ] Serientitel aus JSON gesetzt: "{}"'.format(channel_title))
             
             thumb, picture = img_load(series_root_folder, filename)  #Load locally
             if thumb is None:
