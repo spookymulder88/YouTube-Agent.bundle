@@ -14,7 +14,7 @@ import time                 # HINZUGEFÜGT: Für Performance-Messung
 
 ###Mini Functions ###
 def natural_sort_key     (s):  return [int(text) if text.isdigit() else text for text in re.split(re.compile('([0-9]+)'), str(s).lower())]  ### Avoid 1, 10, 2, 20... #Usage: list.sort(key=natural_sort_key), sorted(list, key=natural_sort_key)
-def sanitize_path        (p):  return p if isinstance(p, unicode) else p.decode(sys.getfilesystemencoding()) ### Make sure the path is unicode, if it is not, decode using OS filesystem's encoding ###
+def sanitize_path        (p):  return "" if p is None else (p if isinstance(p, unicode) else p.decode(sys.getfilesystemencoding())) ### Make sure the path is unicode, if it is not, decode using OS filesystem's encoding ###
 def js_int               (i):  return int(''.join([x for x in list(i or '0') if x.isdigit()]))  # js-like parseInt - https://gist.github.com/douglasmiranda/2174255
 
 ### Return dict value if all fields exists "" otherwise (to allow .isdigit()), avoid key errors
