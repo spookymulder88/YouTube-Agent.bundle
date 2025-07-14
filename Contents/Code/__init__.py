@@ -281,8 +281,8 @@ def Search(results, media, lang, manual, movie):
       result = url.search(dir_basename)  # ✅ Sucht in Ordnername
       if result:
         guid = result.group('id')
-        # Bereinige Serienname (entferne Channel-ID aus Name)
-        clean_name = re.sub(r'\[UC[a-zA-Z0-9\-_]{22,23}\]', '', dir_basename).strip()
+        # Bereinige Serienname (entferne alle YouTube-IDs aus Name)
+        clean_name = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', dir_basename).strip()
         Log.Info(u'search() - YouTube ID found in folder - regex: {}, youtube ID: "{}", clean name: "{}"'.format(regex, guid, clean_name))
         results.Append( MetadataSearchResult( 
           id='youtube|{}|{}'.format(guid, os.path.basename(dir)), 
@@ -362,7 +362,7 @@ def Search(results, media, lang, manual, movie):
   library, root, path = GetLibraryRootPath(dir)
   # VERBESSERT: Extrahiere sauberen Seriennamen aus Ordnerpfad
   series_name = os.path.basename(dir)  # Verwende Ordnername statt Dateiname
-  series_name = re.sub(r'\[.*?\]', '', series_name).strip()  # Entferne alle [xxx] Tags
+  series_name = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', series_name).strip()  # Entferne alle YouTube-IDs
   series_name = re.sub(r'\s+', ' ', series_name).strip()     # Bereinige Leerzeichen
 
   Log(u'Putting folder name "{}" as guid since no assign channel id or playlist id was assigned'.format(series_name))
@@ -389,7 +389,7 @@ def Update(metadata, media, lang, force, movie):
   if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')):  
     # VERBESSERT: Verwende nur den Ordnernamen, nicht den vollständigen Pfad
     folder_name = os.path.basename(dir)
-    clean_title = re.sub(r'\[.*?\]', '', folder_name).strip()
+    clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', folder_name).strip()
     clean_title = re.sub(r'\s+', ' ', clean_title).strip()
     metadata.title = clean_title if clean_title else folder_name
   Log(u''.ljust(157, '='))
@@ -662,8 +662,8 @@ def Update(metadata, media, lang, force, movie):
       folder_name = os.path.basename(dir)
       Log.Info('Analysiere Ordnername fuer Channel-ID: "{}"'.format(folder_name))
       
-      # KORREKTUR: Entferne Channel-ID aus Seriennamen
-      clean_title = re.sub(r'\[UC[a-zA-Z0-9_-]{22,23}\]', '', folder_name).strip()
+      # KORREKTUR: Entferne alle YouTube-IDs aus Seriennamen
+      clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9_-]{16,32}\]', '', folder_name).strip()
       metadata.title = clean_title
       Log.Info('Bereinigte Serie-Titel gesetzt: "{}"'.format(clean_title))
       
@@ -756,7 +756,8 @@ def Update(metadata, media, lang, force, movie):
     episodes    = 0
 
     # WICHTIG: Extrahiere Channel-Titel aus erster JSON-Datei für Serientitel
-    if not metadata.title or os.sep in metadata.title or '[UC' in metadata.title:
+    # ABER NUR für Channels, NICHT für Playlists!
+    if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and (not metadata.title or os.sep in metadata.title or re.search(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', metadata.title)):
         first_json_channel_title = ""
         list_files = os.listdir(series_root_folder) if os.path.exists(series_root_folder) else []
         for file in sorted(list_files):
@@ -774,9 +775,9 @@ def Update(metadata, media, lang, force, movie):
             metadata.title = sanitize_path(first_json_channel_title)
             Log.Info(u'[ ] Serientitel aus erster JSON gesetzt: "{}"'.format(metadata.title))
         else:
-            # Fallback: Ordnername ohne Channel-ID
+            # Fallback: Ordnername ohne YouTube-IDs
             folder_name = os.path.basename(dir)
-            clean_title = re.sub(r'\[UC[a-zA-Z0-9\-_]{22,23}\]', '', folder_name).strip()
+            clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', folder_name).strip()
             metadata.title = clean_title if clean_title else folder_name
             Log.Info(u'[ ] Serientitel aus Ordnername gesetzt: "{}"'.format(metadata.title))
 
@@ -827,8 +828,8 @@ def Update(metadata, media, lang, force, movie):
               channel_title = sanitize_path(json_channel_title)
               Log.Info(u'[ ] channel aus JSON: "{}"'.format(channel_title))
             
-            # FIX: Verwende extrahierten Channel-Titel auch für Serientitel
-            if channel_title and (not metadata.title or os.sep in metadata.title or '[UC' in metadata.title):
+            # FIX: Verwende extrahierten Channel-Titel auch für Serientitel (aber NUR für Channels, nicht Playlists)
+            if channel_title and not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and (not metadata.title or os.sep in metadata.title or re.search(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', metadata.title)):
                 metadata.title = channel_title
                 Log.Info(u'[ ] Serientitel aus JSON gesetzt: "{}"'.format(channel_title))
             
