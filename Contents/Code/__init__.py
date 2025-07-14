@@ -529,7 +529,14 @@ def Update(metadata, media, lang, force, movie):
     if len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD'):
       Log.Info('[?] json_playlist_details')
       try:                    json_playlist_details = json_load(YOUTUBE_PLAYLIST_DETAILS, guid)['items'][0]
-      except Exception as e:  Log('[!] json_playlist_details exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_DETAILS.format(guid, 'personal_key')))
+      except Exception as e:  
+        Log('[!] json_playlist_details exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_DETAILS.format(guid, 'personal_key')))
+        # FALLBACK für Playlists: Verwende Ordnername wenn API fehlschlägt
+        if not metadata.title:
+          folder_name = os.path.basename(dir)
+          clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', folder_name).strip()
+          metadata.title = clean_title if clean_title else folder_name
+          Log.Info('[!] API-Fallback: Playlist-Titel aus Ordnername gesetzt: "{}"'.format(metadata.title))
       else:
         Log.Info('[?] json_playlist_details: {}'.format(json_playlist_details.keys()))
         channel_id                       = Dict(json_playlist_details, 'snippet', 'channelId');                               Log.Info('[ ] channel_id: "{}"'.format(channel_id))
@@ -756,8 +763,8 @@ def Update(metadata, media, lang, force, movie):
     episodes    = 0
 
     # WICHTIG: Extrahiere Channel-Titel aus erster JSON-Datei für Serientitel
-    # ABER NUR für Channels, NICHT für Playlists!
-    if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and (not metadata.title or os.sep in metadata.title or re.search(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', metadata.title)):
+    # ABER NUR für Channels ohne existierenden Titel, NICHT für Playlists!
+    if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and not metadata.title:
         first_json_channel_title = ""
         list_files = os.listdir(series_root_folder) if os.path.exists(series_root_folder) else []
         for file in sorted(list_files):
@@ -828,8 +835,8 @@ def Update(metadata, media, lang, force, movie):
               channel_title = sanitize_path(json_channel_title)
               Log.Info(u'[ ] channel aus JSON: "{}"'.format(channel_title))
             
-            # FIX: Verwende extrahierten Channel-Titel auch für Serientitel (aber NUR für Channels, nicht Playlists)
-            if channel_title and not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and (not metadata.title or os.sep in metadata.title or re.search(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', metadata.title)):
+            # FIX: Verwende extrahierten Channel-Titel nur für echte Channels (nicht für Playlists!)
+            if channel_title and not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and not metadata.title:
                 metadata.title = channel_title
                 Log.Info(u'[ ] Serientitel aus JSON gesetzt: "{}"'.format(channel_title))
             
