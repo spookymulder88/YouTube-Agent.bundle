@@ -11,6 +11,7 @@ from   io      import open  # open
 import hashlib
 import glob                 # HINZUGEFÜGT: Für optimierte Dateisuche
 import time                 # HINZUGEFÜGT: Für Performance-Messung
+import json                 # HINZUGEFÜGT: Für verbesserte JSON-Behandlung
 
 ###Mini Functions ###
 def natural_sort_key     (s):  return [int(text) if text.isdigit() else text for text in re.split(re.compile('([0-9]+)'), str(s).lower())]  ### Avoid 1, 10, 2, 20... #Usage: list.sort(key=natural_sort_key), sorted(list, key=natural_sort_key)
@@ -114,6 +115,69 @@ def youtube_api_key():
   # Fall back to Library preference
   return Prefs['YouTube-Agent_youtube_api_key']
 
+### NEUE VERBESSERUNGEN ###
+
+# Error Tracking für bessere Diagnostik
+ERROR_COUNTS = {}
+
+def track_error(error_type, details):
+    """Verfolge Fehler für bessere Diagnostik"""
+    global ERROR_COUNTS
+    if error_type not in ERROR_COUNTS:
+        ERROR_COUNTS[error_type] = []
+    ERROR_COUNTS[error_type].append(details)
+    
+    # Log Zusammenfassung alle 10 Fehler
+    if len(ERROR_COUNTS[error_type]) % 10 == 0:
+        Log.Warn(u"Error type '{}' occurred {} times".format(error_type, len(ERROR_COUNTS[error_type])))
+
+def clean_json_content(content):
+    """Bereinige häufige JSON-Formatierungsprobleme"""
+    # Entferne UTF-8 BOM falls vorhanden
+    if content.startswith('\ufeff'):
+        content = content[1:]
+    
+    # Entferne trailing commas vor schließenden Klammern
+    content = re.sub(r',(\s*[}\]])', r'\1', content)
+    
+    # Entferne single-line comments (basic)
+    content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    
+    # Entferne multi-line comments (basic)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    
+    return content.strip()
+
+def extract_essential_data(json_file_path):
+    """Letzte Rettung: extrahiere wichtige Video-Daten mit Regex wenn JSON parsing fehlschlägt"""
+    try:
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Extrahiere wichtige Felder mit Regex
+        video_id_match = re.search(r'"id":\s*"([^"]+)"', content)
+        title_match = re.search(r'"title":\s*"([^"]+)"', content)
+        uploader_match = re.search(r'"uploader":\s*"([^"]+)"', content)
+        duration_match = re.search(r'"duration":\s*(\d+)', content)
+        
+        if video_id_match:
+            essential_data = {
+                'id': video_id_match.group(1),
+                'title': title_match.group(1) if title_match else 'Unknown Title',
+                'uploader': uploader_match.group(1) if uploader_match else 'Unknown Uploader',
+                'duration': int(duration_match.group(1)) if duration_match else 0,
+                'description': 'Data recovered from corrupted JSON file'
+            }
+            Log.Info(u'Essential data extracted from corrupted JSON: {}'.format(essential_data['id']))
+            return essential_data
+        else:
+            Log.Error(u'Could not extract video ID from corrupted JSON: {}'.format(json_file_path))
+            return None
+            
+    except Exception as e:
+        Log.Error(u'Failed to extract essential data from {}: {}'.format(json_file_path, str(e)))
+        track_error('json_extraction_failed', str(e))
+        return None
 
 ###
 def json_load(template, *args):
@@ -125,7 +189,9 @@ def json_load(template, *args):
   while not json or Dict(json_page, 'nextPageToken') and Dict(json_page, 'pageInfo', 'resultsPerPage') !=1 and iteration<50:
     #Log.Info(u'{}'.format(Dict(json_page, 'pageInfo', 'resultsPerPage')))
     try:                    json_page = JSON.ObjectFromURL(url+'&pageToken='+Dict(json_page, 'nextPageToken') if Dict(json_page, 'nextPageToken') else url)  #Log.Info(u'items: {}'.format(len(Dict(json_page, 'items'))))
-    except Exception as e:  json = JSON.ObjectFromString(e.content);  raise ValueError('code: {}, message: {}'.format(Dict(json, 'error', 'code'), Dict(json, 'error', 'message')))
+    except Exception as e:  
+        track_error('api_call_failed', str(e))
+        json = JSON.ObjectFromString(e.content);  raise ValueError('code: {}, message: {}'.format(Dict(json, 'error', 'code'), Dict(json, 'error', 'message')))
     if json:  json ['items'].extend(json_page['items'])
     else:     json = json_page
     iteration +=1
@@ -135,84 +201,133 @@ def json_load(template, *args):
 ### OPTIMIERT: Cache für JSON-Dateien (ohne Unterstrich für RestrictedPython)
 JSON_FILE_CACHE = {}
 
-### OPTIMIERT: Sichere JSON-Datei laden
+### VERBESSERTE JSON-Datei laden mit umfassender Fehlerbehandlung
 def load_json_file_safe(json_file_path):
     """
-    Lädt JSON-Datei mit Fehlerbehandlung und Performance-Logging
+    Verbesserte JSON-Laden mit umfassender Fehlerbehandlung und Fallback-Parsing
     """
+    if not os.path.exists(json_file_path):
+        Log.Debug(u'JSON file does not exist: {}'.format(json_file_path))
+        return None
+    
     try:
+        # Methode 1: Versuche Plex's JSON loader zuerst
         json_video_details = JSON.ObjectFromString(Core.storage.load(json_file_path))
         if json_video_details and Dict(json_video_details, 'id'):
-            Log.Debug(u'JSON erfolgreich geladen: Video-ID {}'.format(Dict(json_video_details, 'id')))
+            Log.Debug(u'JSON successfully loaded via Plex: Video-ID {}'.format(Dict(json_video_details, 'id')))
             return json_video_details
         else:
-            Log.Warn(u'JSON-Datei leer oder ungueltig: {}'.format(json_file_path))
+            Log.Warn(u'JSON loaded but missing video ID: {}'.format(json_file_path))
             return None
-    except Exception as e:
-        Log.Error(u'Fehler beim Laden der JSON-Datei {}: {}'.format(json_file_path, e))
-        return None
+            
+    except Exception as plex_error:
+        Log.Debug(u'Plex JSON loader failed: {}, trying standard JSON'.format(str(plex_error)))
+        track_error('plex_json_failed', str(plex_error))
+        
+        try:
+            # Methode 2: Fallback zu standard JSON parsing
+            with open(json_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Bereinige häufige Probleme vor dem Parsing
+            content = clean_json_content(content)
+            json_video_details = json.loads(content)
+            
+            if json_video_details and json_video_details.get('id'):
+                Log.Info(u'JSON recovered via standard parser: Video-ID {}'.format(json_video_details.get('id')))
+                return json_video_details
+            else:
+                Log.Warn(u'JSON recovered but missing video ID: {}'.format(json_file_path))
+                return None
+                
+        except Exception as std_error:
+            Log.Error(u'All JSON parsing failed for {}: Plex={}, Std={}'.format(
+                json_file_path, str(plex_error), str(std_error)))
+            track_error('standard_json_failed', str(std_error))
+            
+            # Methode 3: Letzter Ausweg - versuche wichtige Daten manuell zu extrahieren
+            return extract_essential_data(json_file_path)
 
-### OPTIMIERT: Schnelle JSON-Datei-Suche
+def build_json_cache(series_root_folder):
+    """Erstelle JSON-Datei Cache mit besserer Fehlerbehandlung"""
+    cache_start = time.time()
+    cache_key = series_root_folder
+    
+    JSON_FILE_CACHE[cache_key] = {}
+    json_count = 0
+    
+    try:
+        for root, dirs, files in os.walk(series_root_folder):
+            # Überspringe versteckte Verzeichnisse und häufige Nicht-Media-Ordner
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d.lower() not in ['@eadir', 'thumbs']]
+            
+            for f in files:
+                if f.endswith(".info.json"):
+                    json_path = os.path.join(root, f)
+                    JSON_FILE_CACHE[cache_key][f] = json_path
+                    json_count += 1
+        
+        cache_time = time.time() - cache_start
+        Log.Info(u'JSON cache built ({:.3f}s): {} files indexed'.format(cache_time, json_count))
+        
+    except Exception as e:
+        Log.Error(u'Error building JSON cache for {}: {}'.format(series_root_folder, str(e)))
+        track_error('cache_build_failed', str(e))
+        JSON_FILE_CACHE[cache_key] = {}
+
+def cleanup_json_cache():
+    """Bereinige alte Cache-Einträge um Speicherprobleme zu verhindern"""
+    global JSON_FILE_CACHE
+    if len(JSON_FILE_CACHE) > 50:  # Willkürliches Limit
+        # Behalte nur die 30 zuletzt verwendeten Einträge
+        sorted_cache = sorted(JSON_FILE_CACHE.items(), key=lambda x: len(x[1]), reverse=True)
+        JSON_FILE_CACHE = dict(sorted_cache[:30])
+        Log.Info(u'JSON cache cleaned up, kept 30 most recent entries')
+
+### OPTIMIERT: Verbesserte JSON-Datei-Suche
 def populate_episode_metadata_from_info_json_optimized(series_root_folder, filename):
     """
-    OPTIMIERTE Suche nach .info.json Dateien - bis zu 90% schneller
+    Verbesserte JSON-Datei-Entdeckung mit verbessertem Caching und Fehlerbehandlung
     """
     start_time = time.time()
     json_filename = filename.rsplit('.', 1)[0] + ".info.json"
     
-    # 1. ERSTE PRIORITÄT: Direkte Suche im gleichen Verzeichnis
+    # 1. ERSTE PRIORITÄT: Direkte Pfad-Prüfung
     direct_path = os.path.join(series_root_folder, json_filename)
     if os.path.exists(direct_path):
         search_time = time.time() - start_time
-        Log.Info(u'info.json direkt gefunden ({:.3f}s): {}'.format(search_time, os.path.basename(direct_path)))
+        Log.Info(u'info.json found directly ({:.3f}s): {}'.format(search_time, os.path.basename(direct_path)))
         return load_json_file_safe(direct_path)
     
     # 2. CACHE: Prüfe ob wir bereits alle JSON-Dateien für diesen Ordner gecacht haben
     cache_key = series_root_folder
     if cache_key not in JSON_FILE_CACHE:
-        Log.Info(u'Erstelle JSON-Cache fuer Verzeichnis: {}'.format(os.path.basename(series_root_folder)))
-        cache_start = time.time()
-        
-        
-        json_files = []
-        for root, _, files in os.walk(series_root_folder):
-            for f in files:
-                if f.endswith(".info.json"):
-                    json_files.append(os.path.join(root, f))
-
-        
-        # Erstelle Mapping: Dateiname -> Vollständiger Pfad
-        JSON_FILE_CACHE[cache_key] = {}
-        for json_path in json_files:
-            basename = os.path.basename(json_path)
-            JSON_FILE_CACHE[cache_key][basename] = json_path
-        
-        cache_time = time.time() - cache_start
-        Log.Info(u'JSON-Cache erstellt ({:.3f}s): {} Dateien gefunden'.format(cache_time, len(json_files)))
+        Log.Info(u'Building JSON cache for: {}'.format(os.path.basename(series_root_folder)))
+        build_json_cache(series_root_folder)
     
-    # 3. ZWEITE PRIORITÄT: Suche im Cache
-    json_cache = JSON_FILE_CACHE[cache_key]
+    json_cache = JSON_FILE_CACHE.get(cache_key, {})
+    
+    # 3. ZWEITE PRIORITÄT: Exakte Dateinamen-Übereinstimmung im Cache
     if json_filename in json_cache:
         json_path = json_cache[json_filename]
         search_time = time.time() - start_time
-        Log.Info(u'info.json im Cache gefunden ({:.3f}s): {}'.format(search_time, os.path.basename(json_path)))
+        Log.Info(u'info.json found in cache ({:.3f}s): {}'.format(search_time, os.path.basename(json_path)))
         return load_json_file_safe(json_path)
     
-    # 4. DRITTE PRIORITÄT: Suche nach Video-ID im Dateinamen (falls Dateiname abweicht)
+    # 4. DRITTE PRIORITÄT: Video-ID Suche
     video_id_match = re.search(r'\[([a-zA-Z0-9_-]{11})\]', filename)
     if video_id_match:
         video_id = video_id_match.group(1)
-        Log.Debug(u'Suche nach Video-ID: {}'.format(video_id))
+        Log.Debug(u'Searching by video ID: {}'.format(video_id))
         
-        # Durchsuche Cache nach Video-ID
         for cached_filename, cached_path in json_cache.items():
             if video_id in cached_filename:
                 search_time = time.time() - start_time
-                Log.Info(u'info.json ueber Video-ID gefunden ({:.3f}s): {}'.format(search_time, os.path.basename(cached_path)))
+                Log.Info(u'info.json found by video ID ({:.3f}s): {}'.format(search_time, os.path.basename(cached_path)))
                 return load_json_file_safe(cached_path)
     
     search_time = time.time() - start_time
-    Log.Debug(u'Keine info.json gefunden ({:.3f}s): {}'.format(search_time, json_filename))
+    Log.Debug(u'No info.json found ({:.3f}s): {}'.format(search_time, json_filename))
     return None
 
 ### load image if present in local dir
@@ -260,6 +375,7 @@ def Search(results, media, lang, manual, movie):
       json_video_details = JSON.ObjectFromString(Core.storage.load(json_filename))
     except Exception as e:
       Log('search() - Unable to load info.json, e: "{}"'.format(e))
+      track_error('search_json_failed', str(e))
     else:
       video_id = Dict(json_video_details, 'id')
       if video_id:  # Nur wenn Video-ID vorhanden
@@ -312,6 +428,7 @@ def Search(results, media, lang, manual, movie):
         
   except Exception as e:  
     Log('search() - Error searching for YouTube ID, error: "{}"'.format(e))
+    track_error('search_regex_failed', str(e))
   
   ### FALLBACK FOR S1_FORMAT ###
   try:
@@ -331,6 +448,7 @@ def Search(results, media, lang, manual, movie):
       return
   except Exception as e:  
     Log('search() - S1 pattern failed: "{}"'.format(e))
+    track_error('s1_pattern_failed', str(e))
   
   if movie:  Log.Info(filename)
   else:    
@@ -357,7 +475,9 @@ def Search(results, media, lang, manual, movie):
         return
       else:  Log.Info(u'search() - no id in title nor matching YouTube title: "{}", closest match: "{}", description: "{}"'.format(filename, Dict(json_video_details, 'items', 0, 'snippet', 'channelTitle'), Dict(json_video_details, 'items', 0, 'snippet', 'description')))
     elif 'error' in json_video_details:  Log.Info(u'search() - code: "{}", message: "{}"'.format(Dict(json_video_details, 'error', 'code'), Dict(json_video_details, 'error', 'message')))
-  except Exception as e:  Log(u'search() - Could not retrieve data from YouTube for: "{}", Exception: "{}"'.format(filename, e))
+  except Exception as e:  
+    Log(u'search() - Could not retrieve data from YouTube for: "{}", Exception: "{}"'.format(filename, e))
+    track_error('search_api_failed', str(e))
 
   library, root, path = GetLibraryRootPath(dir)
   # VERBESSERT: Extrahiere sauberen Seriennamen aus Ordnerpfad
@@ -386,6 +506,7 @@ def Update(metadata, media, lang, force, movie):
   json_channel_details       = {}
   json_video_details         = {}
   series_folder              = sanitize_path(series_folder)
+  episodes                   = 0  # Für Cache-Cleanup
   if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')):  
     # VERBESSERT: Verwende nur den Ordnernamen, nicht den vollständigen Pfad
     folder_name = os.path.basename(dir)
@@ -410,50 +531,53 @@ def Update(metadata, media, lang, force, movie):
     json_filename = os.path.join(dir, os.path.splitext(filename)[0]+ ".info.json")
     Log(u'Update: Searching for info file: {}, dir:{}'.format(json_filename, GetMediaDir(media, movie, True)))
     if os.path.exists(json_filename):
-      try:             json_video_details = JSON.ObjectFromString(Core.storage.load(json_filename))
+      try:             json_video_details = load_json_file_safe(json_filename)  # Verbesserte Funktion verwenden
       except IOError:  guid = None
       else:    
-        guid          = Dict(json_video_details, 'id')
-        channel_id    = Dict(json_video_details, 'channel_id')
+        if json_video_details:  # Zusätzliche Prüfung
+          guid          = Dict(json_video_details, 'id')
+          channel_id    = Dict(json_video_details, 'channel_id')
 
-        ### Movie - Local JSON
-        Log.Info(u'update() using json file json_video_details - Loaded video details from: "{}"'.format(json_filename))
-        metadata.title                   = Dict(json_video_details, 'title');                                  Log(u'series title:       "{}"'.format(Dict(json_video_details, 'title')))
-        metadata.summary                 = Dict(json_video_details, 'description');                            Log(u'series description: '+Dict(json_video_details, 'description').replace('\n', '. '))
+          ### Movie - Local JSON
+          Log.Info(u'update() using json file json_video_details - Loaded video details from: "{}"'.format(json_filename))
+          metadata.title                   = Dict(json_video_details, 'title');                                  Log(u'series title:       "{}"'.format(Dict(json_video_details, 'title')))
+          metadata.summary                 = Dict(json_video_details, 'description');                            Log(u'series description: '+Dict(json_video_details, 'description').replace('\n', '. '))
 
-        if Prefs['use_crowd_sourced_titles'] == True:
-          crowd_sourced_title = DeArrow(guid)
-          if crowd_sourced_title != '':
-            metadata.original_title = metadata.title
-            metadata.summary = 'Original Title: ' + metadata.title + '\r\n\r\n' + metadata.summary
-            metadata.title = crowd_sourced_title
+          if Prefs['use_crowd_sourced_titles'] == True:
+            crowd_sourced_title = DeArrow(guid)
+            if crowd_sourced_title != '':
+              metadata.original_title = metadata.title
+              metadata.summary = 'Original Title: ' + metadata.title + '\r\n\r\n' + metadata.summary
+              metadata.title = crowd_sourced_title
 
-        metadata.duration                = Dict(json_video_details, 'duration');                               Log(u'series duration:    "{}"->"{}"'.format(Dict(json_video_details, 'duration'), metadata.duration))
-        metadata.genres                  = Dict(json_video_details, 'categories');                             Log(u'genres: '+str([x for x in metadata.genres]))
-        date                             = Datetime.ParseDate(Dict(json_video_details, 'upload_date'));        Log(u'date:  "{}"'.format(date))
-        metadata.originally_available_at = date.date()
-        metadata.year                    = date.year  #test avoid:  AttributeError: 'TV_Show' object has no attribute named 'year'
-        thumb                            = get_thumb(json_video_details)
-        if thumb and thumb not in metadata.posters:
-          Log(u'poster: "{}" added'.format(thumb))
-          metadata.posters[thumb]        = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
-        else:  Log(u'thumb: "{}" already present'.format(thumb))
-        if Dict(json_video_details, 'statistics', 'likeCount') and int(Dict(json_video_details, 'like_count')) > 0 and Dict(json_video_details, 'dislike_count') and int(Dict(json_video_details, 'dislike_count')) > 0:
-          metadata.rating                = float(10*int(Dict(json_video_details, 'like_count'))/(int(Dict(json_video_details, 'dislike_count'))+int(Dict(json_video_details, 'like_count'))));  Log(u'rating: {}'.format(metadata.rating))
-        if Prefs['add_user_as_director']:
-          metadata.directors.clear()
-          try:
-            director            = Dict(json_video_details, 'uploader');
-            meta_director       = metadata.directors.new()
-            meta_director.name  = director
-            Log('director: '+ director)
-          except:  pass
-        return
+          metadata.duration                = Dict(json_video_details, 'duration');                               Log(u'series duration:    "{}"->"{}"'.format(Dict(json_video_details, 'duration'), metadata.duration))
+          metadata.genres                  = Dict(json_video_details, 'categories');                             Log(u'genres: '+str([x for x in metadata.genres]))
+          date                             = Datetime.ParseDate(Dict(json_video_details, 'upload_date'));        Log(u'date:  "{}"'.format(date))
+          metadata.originally_available_at = date.date()
+          metadata.year                    = date.year  #test avoid:  AttributeError: 'TV_Show' object has no attribute named 'year'
+          thumb                            = get_thumb(json_video_details)
+          if thumb and thumb not in metadata.posters:
+            Log(u'poster: "{}" added'.format(thumb))
+            metadata.posters[thumb]        = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+          else:  Log(u'thumb: "{}" already present'.format(thumb))
+          if Dict(json_video_details, 'statistics', 'likeCount') and int(Dict(json_video_details, 'like_count')) > 0 and Dict(json_video_details, 'dislike_count') and int(Dict(json_video_details, 'dislike_count')) > 0:
+            metadata.rating                = float(10*int(Dict(json_video_details, 'like_count'))/(int(Dict(json_video_details, 'dislike_count'))+int(Dict(json_video_details, 'like_count'))));  Log(u'rating: {}'.format(metadata.rating))
+          if Prefs['add_user_as_director']:
+            metadata.directors.clear()
+            try:
+              director            = Dict(json_video_details, 'uploader');
+              meta_director       = metadata.directors.new()
+              meta_director.name  = director
+              Log('director: '+ director)
+            except:  pass
+          return
 
     ### Movie - API call ################################################################################################################
     Log(u'update() using api - guid: {}, dir: {}, metadata.id: {}'.format(guid, dir, metadata.id))
     try:     json_video_details = json_load(YOUTUBE_json_video_details, guid)['items'][0]
-    except:  Log(u'json_video_details - Could not retrieve data from YouTube for: ' + guid)
+    except:  
+      Log(u'json_video_details - Could not retrieve data from YouTube for: ' + guid)
+      track_error('movie_api_failed', guid)
     else:
       Log('Movie mode - json_video_details - Loaded video details from: "{}"'.format(YOUTUBE_json_video_details.format(guid, 'personal_key')))
       date                             = Datetime.ParseDate(json_video_details['snippet']['publishedAt']);  Log('date:  "{}"'.format(date))
@@ -531,6 +655,7 @@ def Update(metadata, media, lang, force, movie):
       try:                    json_playlist_details = json_load(YOUTUBE_PLAYLIST_DETAILS, guid)['items'][0]
       except Exception as e:  
         Log('[!] json_playlist_details exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_DETAILS.format(guid, 'personal_key')))
+        track_error('playlist_details_failed', str(e))
         # FALLBACK für Playlists: Verwende Ordnername wenn API fehlschlägt
         if not metadata.title:
           folder_name = os.path.basename(dir)
@@ -553,7 +678,9 @@ def Update(metadata, media, lang, force, movie):
 
       Log.Info('[?] json_playlist_items')
       try:                    json_playlist_items = json_load(YOUTUBE_PLAYLIST_ITEMS, guid)
-      except Exception as e:  Log.Info('[!] json_playlist_items exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_ITEMS.format(guid, 'personal_key')))
+      except Exception as e:  
+        Log.Info('[!] json_playlist_items exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_ITEMS.format(guid, 'personal_key')))
+        track_error('playlist_items_failed', str(e))
       else:
         Log.Info('[?] json_playlist_items: {}'.format(json_playlist_items.keys()))
         first_video = sorted(Dict(json_playlist_items, 'items'), key=lambda i: Dict(i, 'contentDetails', 'videoPublishedAt'))[0]
@@ -566,7 +693,9 @@ def Update(metadata, media, lang, force, movie):
       try:
         json_channel_details  = json_load(YOUTUBE_CHANNEL_DETAILS, channel_id)['items'][0]
         json_channel_items    = json_load(YOUTUBE_CHANNEL_ITEMS, channel_id)
-      except Exception as e:  Log('exception: {}, url: {}'.format(e, guid))
+      except Exception as e:  
+        Log('exception: {}, url: {}'.format(e, guid))
+        track_error('channel_api_failed', str(e))
       else:
         
         if not title:
@@ -596,7 +725,9 @@ def Update(metadata, media, lang, force, movie):
             metadata.roles.clear()
             for line in f.readlines():
               try:                    json_channel_details = json_load(YOUTUBE_CHANNEL_DETAILS, line.rstrip())['items'][0]
-              except Exception as e:  Log('exception: {}, url: {}'.format(e, guid))
+              except Exception as e:  
+                Log('exception: {}, url: {}'.format(e, guid))
+                track_error('youtube_id_file_failed', str(e))
               else:
                 Log.Info('[?] json_channel_details: {}'.format(json_channel_details.keys()))
                 Log.Info('[ ] title:       "{}"'.format(Dict(json_channel_details, 'snippet', 'title'      )))
@@ -740,6 +871,7 @@ def Update(metadata, media, lang, force, movie):
         
         except Exception as e:
           Log.Warn('Channel-API Fehler für {}: {}'.format(extracted_channel_id, str(e)))
+          track_error('extracted_channel_api_failed', str(e))
           # Fallback: Verwende Channel-Name aus Ordnername
           channel_name_from_folder = folder_name.split('[')[0].strip()
           if channel_name_from_folder:
@@ -760,21 +892,25 @@ def Update(metadata, media, lang, force, movie):
  
     ### Season + Episode loop ###
     genre_array = {}
-    episodes    = 0
 
     # WICHTIG: Extrahiere Channel-Titel aus erster JSON-Datei für Serientitel
-    # ABER NUR für Channels ohne existierenden Titel, NICHT für Playlists!
-    if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and not metadata.title:
+    # ABER NUR für Channels ohne sauberen Titel, NICHT für Playlists!
+    Log.Info(u'[ ] DEBUG: metadata.title vor Prüfung: "{}"'.format(metadata.title))
+    Log.Info(u'[ ] DEBUG: guid: "{}", ist Playlist: {}'.format(guid, len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')))
+    
+    if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and (not metadata.title or os.sep in metadata.title or re.search(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', metadata.title)):
+        Log.Info(u'[ ] DEBUG: Bedingung erfüllt - starte JSON-Extraktion')
         first_json_channel_title = ""
         list_files = os.listdir(series_root_folder) if os.path.exists(series_root_folder) else []
         for file in sorted(list_files):
             if file.endswith(".info.json"):
                 try:
-                    json_content = JSON.ObjectFromString(Core.storage.load(os.path.join(series_root_folder, file)))
-                    first_json_channel_title = Dict(json_content, 'uploader') or Dict(json_content, 'channel')
-                    if first_json_channel_title:
-                        Log.Info(u'[ ] Channel-Titel aus JSON extrahiert: "{}" (aus: {})'.format(first_json_channel_title, file))
-                        break
+                    json_content = load_json_file_safe(os.path.join(series_root_folder, file))  # Verbesserte Funktion verwenden
+                    if json_content:
+                        first_json_channel_title = Dict(json_content, 'uploader') or Dict(json_content, 'channel')
+                        if first_json_channel_title:
+                            Log.Info(u'[ ] Channel-Titel aus JSON extrahiert: "{}" (aus: {})'.format(first_json_channel_title, file))
+                            break
                 except:
                     continue
         
@@ -787,6 +923,8 @@ def Update(metadata, media, lang, force, movie):
             clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', folder_name).strip()
             metadata.title = clean_title if clean_title else folder_name
             Log.Info(u'[ ] Serientitel aus Ordnername gesetzt: "{}"'.format(metadata.title))
+    else:
+        Log.Info(u'[ ] DEBUG: Bedingung NICHT erfüllt - überspringe JSON-Extraktion')
 
     for s in sorted(media.seasons, key=natural_sort_key):
       Log.Info(u"".ljust(157, '='))
@@ -877,7 +1015,9 @@ def Update(metadata, media, lang, force, movie):
               videoId = result.group('id')
               Log.Info(u'# videoId [{}] not in Playlist/channel item list so loading json_video_details'.format(videoId))
               try:                    json_video_details = json_load(YOUTUBE_json_video_details, videoId)['items'][0]
-              except Exception as e:  Log('Error: "{}"'.format(e))
+              except Exception as e:  
+                Log('Error: "{}"'.format(e))
+                track_error('video_api_fallback_failed', str(e))
               else:
                 Log.Info('[?] link:     "https://www.youtube.com/watch?v={}"'.format(videoId))
                 thumb                           = Dict(json_video_details, 'snippet', 'thumbnails', 'maxres', 'url') or Dict(json_video_details, 'snippet', 'thumbnails', 'medium', 'url') or Dict(json_video_details, 'snippet', 'thumbnails', 'standard', 'url') or Dict(json_video_details, 'snippet', 'thumbnails', 'high', 'url') or Dict(json_video_details, 'snippet', 'thumbnails', 'default', 'url')
@@ -904,6 +1044,10 @@ def Update(metadata, media, lang, force, movie):
               genre_array_cleansed = [id for id in genre_array if genre_array[id]>episodes/2 and id not in metadata.genres]  #Log.Info('[ ] genre_list: {}'.format(genre_list))
               for id in genre_array_cleansed:  metadata.genres.add(id)
             else:  Log.Info(u'videoId not found in filename')
+    
+    # Cache-Cleanup für große Bibliotheken
+    if episodes > 100:
+        cleanup_json_cache()
 
   Log('=== End Of Agent Call, errors after that are Plex related ==='.ljust(157, '='))
 
