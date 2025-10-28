@@ -263,6 +263,71 @@ def json_load(template, *args):
 ### OPTIMIERT: Cache für JSON-Dateien (ohne Unterstrich für RestrictedPython)
 JSON_FILE_CACHE = {}
 
+### API-Response Cache für Performance-Optimierung
+API_RESPONSE_CACHE = {}
+API_CACHE_TTL = 3600  # 1 Stunde in Sekunden
+
+def json_load_cached(template, *args, **kwargs):
+  """
+  Gecachte Version von json_load() für API-Responses
+  - Cache-TTL: 1 Stunde (3600 Sekunden)
+  - Reduziert redundante API-Calls bei Updates
+  - force_refresh=True überspringt Cache
+  """
+  import time
+
+  force_refresh = kwargs.get('force_refresh', False)
+  cache_key = template.format(*args + tuple(['CACHE_KEY']))
+  current_time = time.time()
+
+  # Cache prüfen (wenn nicht force_refresh)
+  if not force_refresh and cache_key in API_RESPONSE_CACHE:
+    cached_entry = API_RESPONSE_CACHE[cache_key]
+    cache_age = current_time - cached_entry['timestamp']
+
+    if cache_age < API_CACHE_TTL:
+      Log.Info(u'[CACHE HIT] Using cached API response (age: {:.0f}s)'.format(cache_age))
+      return cached_entry['data']
+    else:
+      Log.Info(u'[CACHE EXPIRED] Cache too old ({:.0f}s), refreshing...'.format(cache_age))
+
+  # Cache-Miss oder abgelaufen: Fresh API-Call
+  Log.Info(u'[CACHE MISS] Loading fresh API data...')
+  try:
+    data = json_load(template, *args)
+
+    # In Cache speichern
+    API_RESPONSE_CACHE[cache_key] = {
+      'data': data,
+      'timestamp': current_time
+    }
+
+    Log.Info(u'[CACHE STORED] API response cached for future use')
+    return data
+
+  except Exception as e:
+    Log.Error(u'[CACHE ERROR] API call failed: {}'.format(str(e)))
+    raise
+
+def cleanup_api_cache():
+  """
+  Entfernt abgelaufene Cache-Einträge (älter als 2 Stunden)
+  """
+  import time
+  current_time = time.time()
+  expired_keys = []
+
+  for key, entry in API_RESPONSE_CACHE.items():
+    cache_age = current_time - entry['timestamp']
+    if cache_age > (API_CACHE_TTL * 2):  # 2 Stunden
+      expired_keys.append(key)
+
+  for key in expired_keys:
+    del API_RESPONSE_CACHE[key]
+
+  if expired_keys:
+    Log.Info(u'[CACHE CLEANUP] Removed {} expired entries, {} active'.format(len(expired_keys), len(API_RESPONSE_CACHE)))
+
 ### VERBESSERTE JSON-Datei laden mit umfassender Fehlerbehandlung
 def load_json_file_safe(json_file_path):
     """
@@ -495,7 +560,7 @@ def Search(results, media, lang, manual, movie):
       return
     
     # Dann Playlist-IDs
-    playlist_match = re.search(r'\[([PL][a-zA-Z0-9\-_]{16,32}|[UFL][UL][a-zA-Z0-9\-_]{22}|RD[a-zA-Z0-9\-_]{22})\]', dir_basename)
+    playlist_match = re.search(r'\[(PL[a-zA-Z0-9\-_]{16,32}|UU[a-zA-Z0-9\-_]{22}|FL[a-zA-Z0-9\-_]{22}|LP[a-zA-Z0-9\-_]{22}|RD[a-zA-Z0-9\-_]{22})\]', dir_basename)
     if playlist_match:
       playlist_id = playlist_match.group(1)
       clean_name = re.sub(r'\[[PL][a-zA-Z0-9\-_]{16,32}\]|\[[UFL][UL][a-zA-Z0-9\-_]{22}\]|\[RD[a-zA-Z0-9\-_]{22}\]', '', dir_basename).strip()
@@ -677,7 +742,21 @@ def Update(metadata, media, lang, force, movie):
   json_video_details         = {}
   series_folder              = sanitize_path(series_folder)
   episodes                   = 0  # Für Cache-Cleanup
-  
+
+  # PERFORMANCE: Erkenne Initial Scan vs Update-Modus
+  is_initial_scan = True
+  if not movie:  # Nur für TV-Shows/Series relevant
+    try:
+      # Prüfe ob bereits Metadaten vorhanden sind
+      has_existing_metadata = len(metadata.seasons) > 0
+      if has_existing_metadata:
+        is_initial_scan = False
+        Log.Info(u'[UPDATE MODE] Incremental update detected - using optimized caching')
+      else:
+        Log.Info(u'[INITIAL SCAN] First scan detected - loading all metadata')
+    except:
+      is_initial_scan = True  # Fallback zu Initial Scan bei Fehlern
+
   # Setze Standard-Titel basierend auf Ordnername
   if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and guid_type != 'playlist':  
     folder_name = os.path.basename(dir)
@@ -851,7 +930,7 @@ def Update(metadata, media, lang, force, movie):
     ### Series - Playlist ###############################################################################################################
     if (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) or guid_type == 'playlist':
       Log.Info('[?] json_playlist_details for GUID: {}'.format(guid))
-      try:                    json_playlist_details = json_load(YOUTUBE_PLAYLIST_DETAILS, guid)['items'][0]
+      try:                    json_playlist_details = json_load_cached(YOUTUBE_PLAYLIST_DETAILS, guid, force_refresh=is_initial_scan)['items'][0]
       except Exception as e:  
         Log('[!] json_playlist_details exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_DETAILS.format(guid, 'personal_key')))
         track_error('playlist_details_failed', str(e))
@@ -889,7 +968,7 @@ def Update(metadata, media, lang, force, movie):
             metadata.title = xml_safe(crowd_sourced_title)  # XML-SAFE
 
       Log.Info('[?] json_playlist_items')
-      try:                    json_playlist_items = json_load(YOUTUBE_PLAYLIST_ITEMS, guid)
+      try:                    json_playlist_items = json_load_cached(YOUTUBE_PLAYLIST_ITEMS, guid, force_refresh=is_initial_scan)
       except Exception as e:  
         Log.Info('[!] json_playlist_items exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_ITEMS.format(guid, 'personal_key')))
         track_error('playlist_items_failed', str(e))
@@ -899,6 +978,10 @@ def Update(metadata, media, lang, force, movie):
         thumb = Dict(first_video, 'snippet', 'thumbnails', 'maxres', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'medium', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'standard', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'high', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'default', 'url')
         if thumb and thumb not in metadata.posters:  Log('[ ] posters:   {}'.format(thumb));  metadata.posters [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1 if Prefs['media_poster_source']=='Episode' else 2)
         else:                                        Log('[X] posters:   {}'.format(thumb))
+        if thumb and thumb not in metadata.art:      Log('[X] art:       {}'.format(thumb));  metadata.art [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+        else:                                        Log('[ ] art:       {}'.format(thumb))
+        if thumb and thumb not in metadata.banners:  Log('[X] banners:   {}'.format(thumb));  metadata.banners [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+        else:                                        Log('[ ] banners:   {}'.format(thumb))
     
     ### Series - Channel ###############################################################################################################
     if (channel_id.startswith('UC') or channel_id.startswith('HC')) or guid_type == 'channel':
@@ -907,8 +990,9 @@ def Update(metadata, media, lang, force, movie):
       Log.Info('[?] Processing Channel ID: {}'.format(actual_channel_id))
       
       try:
-        json_channel_details  = json_load(YOUTUBE_CHANNEL_DETAILS, actual_channel_id)['items'][0]
-        json_channel_items    = json_load(YOUTUBE_CHANNEL_ITEMS, actual_channel_id)
+        # PERFORMANCE: Nutze Cache für Channel-Details/Items (außer bei force_refresh)
+        json_channel_details  = json_load_cached(YOUTUBE_CHANNEL_DETAILS, actual_channel_id, force_refresh=is_initial_scan)['items'][0]
+        json_channel_items    = json_load_cached(YOUTUBE_CHANNEL_ITEMS, actual_channel_id, force_refresh=is_initial_scan)
       except Exception as e:  
         Log('exception: {}, url: {}'.format(e, actual_channel_id))
         track_error('channel_api_failed', str(e))
@@ -1142,6 +1226,14 @@ def Update(metadata, media, lang, force, movie):
     else:
         Log.Info(u'[ ] DEBUG: Bedingung NICHT erfüllt - überspringe JSON-Extraktion')
 
+    # PERFORMANCE: O(1) Lookup-Dictionary für Videos (statt O(n²) verschachtelte Schleifen)
+    video_lookup_by_id = {}
+    for video in Dict(json_playlist_items, 'items') or Dict(json_channel_items, 'items') or []:
+        videoId = Dict(video, 'id', 'videoId') or Dict(video, 'snippet', 'resourceId', 'videoId')
+        if videoId:
+            video_lookup_by_id[videoId] = video
+    Log.Info(u'[PERFORMANCE] Created video lookup dictionary with {} entries'.format(len(video_lookup_by_id)))
+
     for s in sorted(media.seasons, key=natural_sort_key):
       Log.Info(u"".ljust(157, '='))
       Log.Info(u"Season: {:>2}".format(s))
@@ -1151,19 +1243,20 @@ def Update(metadata, media, lang, force, movie):
         episode   = metadata.seasons[s].episodes[e]
         episodes += 1
         Log.Info('metadata.seasons[{:>2}].episodes[{:>3}] "{}"'.format(s, e, filename))
-        
-        for video in Dict(json_playlist_items, 'items') or Dict(json_channel_items, 'items') or {}:
-          
-          # videoId in Playlist/channel
-          videoId = Dict(video, 'id', 'videoId') or Dict(video, 'snippet', 'resourceId', 'videoId')
-          if videoId and videoId in filename:
+
+        # PERFORMANCE: O(1) Lookup statt O(n) Schleife - extrahiere videoId aus Filename
+        video_found = False
+        for videoId in video_lookup_by_id.keys():
+          if videoId in filename:
+            video = video_lookup_by_id[videoId]
+
             title_api = xml_safe(Dict(video, 'snippet', 'title'))  # XML-SAFE
             if title_api.lower() in ('private video', 'deleted video', 'video unavailable', ''):
                 Log.Info(u'Skippe Platzhalter-Titel – verwende lokale info.json')
                 continue
             episode.title = title_api
             episode.summary = xml_safe(Dict(video, 'snippet', 'description').replace('\n', '. '))  # XML-SAFE
-            
+
             # SICHERES DATUM-PARSING FÜR PLAYLIST/CHANNEL ITEMS
             published_at = Dict(video, 'snippet', 'publishedAt')
             if published_at:
@@ -1174,16 +1267,17 @@ def Update(metadata, media, lang, force, movie):
                   Log.Info(u'[ ] API episode date: "{}"'.format(published_at))
               except Exception as e:
                 Log.Info(u'[ ] API episode date parsing error: "{}", error: {}'.format(published_at, str(e)))
-            
+
             thumb = Dict(video, 'snippet', 'thumbnails', 'high', 'url') or Dict(video, 'snippet', 'thumbnails', 'default', 'url')
             if thumb and thumb not in episode.thumbs:
                 episode.thumbs[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
                 episode.thumbs.validate_keys([thumb])
             Log.Info(u'[ ] channelTitle: {}'.format(Dict(video, 'snippet', 'channelTitle')))
+            video_found = True
             break
 
-        
-        else:  # videoId not in Playlist/channel item list
+
+        if not video_found:  # videoId not in Playlist/channel item list
 
           ### OPTIMIERT: Verwende neue optimierte JSON-Suche ###
           json_video_details = populate_episode_metadata_from_info_json_optimized(series_root_folder, filename)
@@ -1206,7 +1300,7 @@ def Update(metadata, media, lang, force, movie):
                 Log.Info(u'[ ] Serientitel aus JSON gesetzt: "{}"'.format(channel_title))
             
             thumb, picture = img_load(series_root_folder, filename)  #Load locally
-            if thumb is None:
+            if not thumb:
               thumb = get_thumb(json_video_details)
               if thumb not in episode.thumbs: picture = HTTP.Request(thumb).content  
             if thumb and thumb not in episode.thumbs:
@@ -1334,6 +1428,9 @@ def Update(metadata, media, lang, force, movie):
     # Cache-Cleanup für große Bibliotheken
     if episodes > 100:
         cleanup_json_cache()
+
+    # API-Cache-Cleanup (immer durchführen)
+    cleanup_api_cache()
 
   Log('=== End Of Agent Call, errors after that are Plex related ==='.ljust(157, '='))
 
