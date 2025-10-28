@@ -55,14 +55,33 @@ def xml_safe(s):
     return s.strip()
 
 def safe_id_component(s):
-    """Erstellt sichere ID-Komponenten für GUIDs"""
+    """Erstellt sichere ID-Komponenten für GUIDs - entfernt alle Problematischen Zeichen inkl. Emojis"""
     if s is None:
         return 'unknown'
-    s = xml_safe(s)
+
+    # Konvertiere zu Unicode falls nötig
+    if not isinstance(s, unicode):
+        try:
+            s = s.decode('utf-8', 'replace')
+        except:
+            s = unicode(str(s), errors='replace')
+
+    # Encode zu ASCII und ersetze alle nicht-ASCII Zeichen (Emojis, etc.)
+    try:
+        # encode('ascii', 'ignore') entfernt alle Unicode-Zeichen inkl. Emojis
+        s = s.encode('ascii', 'ignore').decode('ascii')
+    except:
+        pass
+
+    # Entferne XML-problematische Zeichen
+    s = re.sub(r'[\x00-\x1F\x7F]', '', s)  # Steuerzeichen
+
     # Entferne alle nicht-alphanumerischen Zeichen außer ._-
     s = re.sub(r'[^A-Za-z0-9._-]+', '_', s)
+
     # Entferne führende/trailing Underscores und begrenze Länge
     s = s.strip('_')[:120]
+
     return s if s else 'unknown'
 
 def create_youtube_guid(guid_type, youtube_id, folder_component):
@@ -465,6 +484,43 @@ def img_load(series_root_folder, filename):
     if os.path.isfile(filename):  Log(u'local thumbnail found for file %s', filename);  return filename, Core.storage.load(filename)
   return "", None
 
+### load series-level images (poster, fanart, banner) from local dir
+def img_load_series(series_folder, image_type='poster'):
+  """
+  Load series-level images from local directory.
+
+  Args:
+    series_folder: Path to the series folder
+    image_type: Type of image to load ('poster', 'fanart', 'banner')
+
+  Returns:
+    tuple: (filename, image_data) if found, ("", None) if not found
+  """
+  # Define filenames to check based on image type
+  if image_type == 'poster':
+    filenames = ['folder', 'poster', 'cover']
+  elif image_type == 'fanart':
+    filenames = ['fanart', 'backdrop', 'background', 'art']
+  elif image_type == 'banner':
+    filenames = ['banner']
+  else:
+    return "", None
+
+  # Check each filename with various extensions
+  for base_name in filenames:
+    for ext in ['jpg', 'jpeg', 'png', 'gif']:
+      filepath = os.path.join(series_folder, '{}.{}'.format(base_name, ext))
+      if os.path.isfile(filepath):
+        try:
+          image_data = Core.storage.load(filepath)
+          Log.Info(u'[LOCAL IMAGE] Found {} in series folder: {}'.format(image_type, os.path.basename(filepath)))
+          return filepath, image_data
+        except Exception as e:
+          Log.Warn(u'[LOCAL IMAGE] Failed to load {}: {}'.format(filepath, str(e)))
+          continue
+
+  return "", None
+
 ### get biggest thumbnail available
 def get_thumb(json_video_details):
   thumbnails = Dict(json_video_details, 'thumbnails')
@@ -733,7 +789,21 @@ def Update(metadata, media, lang, force, movie):
     guid, series_folder, guid_type = "unknown", "unknown", 'unknown'
   
   dir                        = sanitize_path(GetMediaDir(media, movie))
-  channel_id                 = guid if guid.startswith('UC') or guid.startswith('HC') or guid_type == 'channel' else ''
+
+  # WICHTIG: Prüfe ob Playlist-ID im Ordnernamen ist und überschreibe guid_type
+  folder_name = os.path.basename(dir)
+  playlist_id_match = re.search(r'\[(PL|UU|FL|LP|RD)[a-zA-Z0-9_-]{16,34}\]', folder_name)
+  original_channel_id = guid if guid.startswith('UC') or guid.startswith('HC') else ''
+
+  if playlist_id_match:
+    playlist_id_from_folder = playlist_id_match.group(0)[1:-1]  # Entferne []
+    if guid_type == 'channel' or guid_type == 'unknown':
+      Log.Info('Playlist-ID im Ordnernamen gefunden - überschreibe guid_type von "{}" zu "playlist"'.format(guid_type))
+      guid_type = 'playlist'
+      guid = playlist_id_from_folder
+      Log.Info('Playlist-ID: {}'.format(guid))
+
+  channel_id                 = original_channel_id if original_channel_id else (guid if guid.startswith('UC') or guid.startswith('HC') or guid_type == 'channel' else '')
   channel_title              = ""
   json_playlist_details      = {}
   json_playlist_items        = {}
@@ -758,11 +828,15 @@ def Update(metadata, media, lang, force, movie):
       is_initial_scan = True  # Fallback zu Initial Scan bei Fehlern
 
   # Setze Standard-Titel basierend auf Ordnername
-  if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and guid_type != 'playlist':  
+  if not (len(guid)>2 and guid[0:2] in ('PL', 'UU', 'FL', 'LP', 'RD')) and guid_type != 'playlist':
     folder_name = os.path.basename(dir)
-    clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', folder_name).strip()
-    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-    metadata.title = xml_safe(clean_title if clean_title else folder_name)  # XML-SAFE
+    # Entferne YouTube-IDs (sowohl in Klammern als auch angehängt)
+    clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,34}\]', '', folder_name)
+    clean_title = re.sub(r'[_\s]+(UC|HC)[a-zA-Z0-9\-_]{22}$', '', clean_title)
+    # Unterstriche durch Leerzeichen ersetzen und bereinigen
+    clean_title = clean_title.replace('_', ' ').strip()
+    clean_title = re.sub(r'\s+', ' ', clean_title)
+    metadata.title = sanitize_path(clean_title if clean_title else folder_name)
   Log(u''.ljust(157, '='))
     
   ### Movie Library ###
@@ -790,7 +864,7 @@ def Update(metadata, media, lang, force, movie):
 
           ### Movie - Local JSON
           Log.Info(u'update() using json file json_video_details - Loaded video details from: "{}"'.format(json_filename))
-          metadata.title                   = xml_safe(Dict(json_video_details, 'title'));                                  Log(u'series title:       "{}"'.format(Dict(json_video_details, 'title')))  # XML-SAFE
+          metadata.title                   = sanitize_path(Dict(json_video_details, 'title'));                                  Log(u'series title:       "{}"'.format(Dict(json_video_details, 'title')))
           metadata.summary                 = xml_safe(Dict(json_video_details, 'description'));                            Log(u'series description: '+Dict(json_video_details, 'description').replace('\n', '. '))  # XML-SAFE
 
           if Prefs['use_crowd_sourced_titles'] == True:
@@ -860,8 +934,8 @@ def Update(metadata, media, lang, force, movie):
           Log.Info('API movie date parsing error: "{}", error: {}'.format(published_at, str(e)))
       else:
         Log.Info('No publishedAt found in API response')
-      
-      metadata.title = xml_safe(json_video_details['snippet']['title']); Log(u'series title: "{}"'.format(json_video_details['snippet']['title']))  # XML-SAFE
+
+      metadata.title = sanitize_path(json_video_details['snippet']['title']); Log(u'series title: "{}"'.format(json_video_details['snippet']['title']))
       metadata.summary = xml_safe(json_video_details['snippet']['description']); Log(u'series description: '+json_video_details['snippet']['description'].replace('\n', '. '))  # XML-SAFE
 
       if Prefs['use_crowd_sourced_titles'] == True:
@@ -937,13 +1011,19 @@ def Update(metadata, media, lang, force, movie):
         # FALLBACK für Playlists: Verwende Ordnername wenn API fehlschlägt
         if not metadata.title:
           folder_name = os.path.basename(dir)
-          clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', folder_name).strip()
-          metadata.title = xml_safe(clean_title if clean_title else folder_name)  # XML-SAFE
+          # Entferne YouTube-IDs (sowohl in Klammern als auch angehängt)
+          clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,34}\]', '', folder_name)
+          clean_title = re.sub(r'[_\s]+(PL|UU|FL|LP|RD)[a-zA-Z0-9\-_]{16,34}$', '', clean_title)
+          # Unterstriche durch Leerzeichen ersetzen und bereinigen
+          clean_title = clean_title.replace('_', ' ').strip()
+          clean_title = re.sub(r'\s+', ' ', clean_title)
+          metadata.title = sanitize_path(clean_title if clean_title else folder_name)
           Log.Info('[!] API-Fallback: Playlist-Titel aus Ordnername gesetzt: "{}"'.format(metadata.title))
       else:
         Log.Info('[?] json_playlist_details: {}'.format(json_playlist_details.keys()))
         channel_id                       = Dict(json_playlist_details, 'snippet', 'channelId');                               Log.Info('[ ] channel_id: "{}"'.format(channel_id))
-        title                            = xml_safe(sanitize_path(Dict(json_playlist_details, 'snippet', 'title')));                    Log.Info('[ ] title:      "{}"'.format(title))  # XML-SAFE
+        # Playlist-Titel: Verwende sanitize_path() für Unicode-Konvertierung ohne Zeichen-Ersetzung
+        title                            = sanitize_path(Dict(json_playlist_details, 'snippet', 'title'));                    Log.Info('[ ] title:      "{}"'.format(title))
         if title: metadata.title = title
         
         # SICHERES DATUM-PARSING FÜR PLAYLISTS
@@ -969,19 +1049,33 @@ def Update(metadata, media, lang, force, movie):
 
       Log.Info('[?] json_playlist_items')
       try:                    json_playlist_items = json_load_cached(YOUTUBE_PLAYLIST_ITEMS, guid, force_refresh=is_initial_scan)
-      except Exception as e:  
+      except Exception as e:
         Log.Info('[!] json_playlist_items exception: {}, url: {}'.format(e, YOUTUBE_PLAYLIST_ITEMS.format(guid, 'personal_key')))
         track_error('playlist_items_failed', str(e))
       else:
         Log.Info('[?] json_playlist_items: {}'.format(json_playlist_items.keys()))
-        first_video = sorted(Dict(json_playlist_items, 'items'), key=lambda i: Dict(i, 'contentDetails', 'videoPublishedAt'))[0]
-        thumb = Dict(first_video, 'snippet', 'thumbnails', 'maxres', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'medium', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'standard', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'high', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'default', 'url')
-        if thumb and thumb not in metadata.posters:  Log('[ ] posters:   {}'.format(thumb));  metadata.posters [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1 if Prefs['media_poster_source']=='Episode' else 2)
-        else:                                        Log('[X] posters:   {}'.format(thumb))
-        if thumb and thumb not in metadata.art:      Log('[X] art:       {}'.format(thumb));  metadata.art [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
-        else:                                        Log('[ ] art:       {}'.format(thumb))
-        if thumb and thumb not in metadata.banners:  Log('[X] banners:   {}'.format(thumb));  metadata.banners [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
-        else:                                        Log('[ ] banners:   {}'.format(thumb))
+
+        # ====== POSTER: Priorität: 1. folder.jpg, 2. Erstes Video, 3. Channel Avatar ======
+        poster_path, poster_data = img_load_series(dir, 'poster')
+        if poster_path and poster_data:
+          # Lokales Poster gefunden (höchste Priorität)
+          if poster_path not in metadata.posters:
+            metadata.posters[poster_path] = Proxy.Media(poster_data, sort_order=1)
+            Log.Info(u'[X] posters: LOCAL {} (sort_order=1)'.format(os.path.basename(poster_path)))
+          else:
+            Log.Info(u'[ ] posters: LOCAL {} already added'.format(os.path.basename(poster_path)))
+        else:
+          # Fallback: Erstes Video-Thumbnail von Playlist
+          first_video = sorted(Dict(json_playlist_items, 'items'), key=lambda i: Dict(i, 'contentDetails', 'videoPublishedAt'))[0]
+          thumb = Dict(first_video, 'snippet', 'thumbnails', 'maxres', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'medium', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'standard', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'high', 'url') or Dict(first_video, 'snippet', 'thumbnails', 'default', 'url')
+          if thumb and thumb not in metadata.posters:
+            metadata.posters[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1 if Prefs['media_poster_source']=='Episode' else 2)
+            Log.Info(u'[ ] posters: First video thumbnail (sort_order={})'.format(1 if Prefs['media_poster_source']=='Episode' else 2))
+          elif thumb:
+            Log.Info(u'[X] posters: {} already added'.format(thumb))
+
+        # WICHTIG: metadata.art und metadata.banners werden NICHT hier gesetzt!
+        # Diese werden vom Channel-Block übernommen (Channel Banner oder lokale fanart.jpg)
     
     ### Series - Channel ###############################################################################################################
     if (channel_id.startswith('UC') or channel_id.startswith('HC')) or guid_type == 'channel':
@@ -997,18 +1091,19 @@ def Update(metadata, media, lang, force, movie):
         Log('exception: {}, url: {}'.format(e, actual_channel_id))
         track_error('channel_api_failed', str(e))
       else:
-        
+
         if not title:
-          title          = xml_safe(re.sub( "\s*\[.*?\]\s*"," ",series_folder))  #instead of path use series foldername  # XML-SAFE
+          title          = sanitize_path(re.sub( "\s*\[.*?\]\s*"," ",series_folder))  #instead of path use series foldername
           metadata.title = title
         Log.Info('[ ] title:        "{}", metadata.title: "{}"'.format(title, metadata.title))
         if not Dict(json_playlist_details, 'snippet', 'description'):
-          if Dict(json_channel_details, 'snippet', 'description'):  metadata.summary = xml_safe(sanitize_path(Dict(json_channel_details, 'snippet', 'description')))  # XML-SAFE
+          # FIX: sanitize_path() NICHT für Display-Texte verwenden!
+          if Dict(json_channel_details, 'snippet', 'description'):  metadata.summary = xml_safe(Dict(json_channel_details, 'snippet', 'description'))  # XML-SAFE
           else:
             summary  = u'Channel with {} videos, '.format(Dict(json_channel_details, 'statistics', 'videoCount'))
             summary += u'{} subscribers, '.format(Dict(json_channel_details, 'statistics', 'subscriberCount'))
             summary += u'{} views'.format(Dict(json_channel_details, 'statistics', 'viewCount'))
-            metadata.summary = xml_safe(sanitize_path(summary));  Log.Info(u'[ ] summary:     "{}"'.format(summary))  #  # XML-SAFE
+            metadata.summary = xml_safe(summary);  Log.Info(u'[ ] summary:     "{}"'.format(summary))  #  # XML-SAFE
 
         if Prefs['use_crowd_sourced_titles'] == True:
           crowd_sourced_title = DeArrow(guid)
@@ -1046,19 +1141,38 @@ def Update(metadata, media, lang, force, movie):
                 
                 thumb_channel = Dict(json_channel_details, 'snippet', 'thumbnails', 'medium', 'url') or Dict(json_channel_details, 'snippet', 'thumbnails', 'high', 'url')   or Dict(json_channel_details, 'snippet', 'thumbnails', 'default', 'url')
                 role       = metadata.roles.new()
-                role.role  = xml_safe(sanitize_path(Dict(json_channel_details, 'snippet', 'title')))  # XML-SAFE
-                role.name  = xml_safe(sanitize_path(Dict(json_channel_details, 'snippet', 'title')))  # XML-SAFE
+                # FIX: sanitize_path() NICHT für Display-Namen verwenden!
+                role.role  = xml_safe(Dict(json_channel_details, 'snippet', 'title'))  # XML-SAFE
+                role.name  = xml_safe(Dict(json_channel_details, 'snippet', 'title'))  # XML-SAFE
                 role.photo = thumb_channel
                 Log.Info('[ ] role:        {}'.format(Dict(json_channel_details,'snippet','title')))
-                
-                thumb = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvLowImageUrl' ) or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvMediumImageUrl') \
-                  or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvHighImageUrl') or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvImageUrl'      )
-                external_banner_url = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerExternalUrl')
-                if not thumb and external_banner_url: thumb = '{}=s1920'.format(external_banner_url)
-                if thumb and thumb not in metadata.art:      Log('[X] art:       {}'.format(thumb));  metadata.art [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
-                else:                                        Log('[ ] art:       {}'.format(thumb))
-                if thumb and thumb not in metadata.banners:  Log('[X] banners:   {}'.format(thumb));  metadata.banners [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
-                else:                                        Log('[ ] banners:   {}'.format(thumb))
+
+                # ====== ART/BANNERS: Priorität: 1. fanart.jpg, 2. Channel Banner ======
+                fanart_path, fanart_data = img_load_series(dir, 'fanart')
+                if fanart_path and fanart_data:
+                  # Lokales Fanart gefunden (höchste Priorität)
+                  if fanart_path not in metadata.art:
+                    metadata.art[fanart_path] = Proxy.Media(fanart_data, sort_order=1)
+                    Log.Info(u'[X] art: LOCAL {} (sort_order=1)'.format(os.path.basename(fanart_path)))
+                  if fanart_path not in metadata.banners:
+                    metadata.banners[fanart_path] = Proxy.Media(fanart_data, sort_order=1)
+                    Log.Info(u'[X] banners: LOCAL {} (sort_order=1)'.format(os.path.basename(fanart_path)))
+                else:
+                  # Fallback: Channel Banner von API
+                  thumb = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvLowImageUrl' ) or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvMediumImageUrl') \
+                    or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvHighImageUrl') or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvImageUrl'      )
+                  external_banner_url = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerExternalUrl')
+                  if not thumb and external_banner_url: thumb = '{}=s1920'.format(external_banner_url)
+                  if thumb and thumb not in metadata.art:
+                    metadata.art[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+                    Log.Info(u'[X] art: Channel banner from API')
+                  elif thumb:
+                    Log.Info(u'[ ] art: {} already added'.format(thumb))
+                  if thumb and thumb not in metadata.banners:
+                    metadata.banners[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+                    Log.Info(u'[X] banners: Channel banner from API')
+                  elif thumb:
+                    Log.Info(u'[ ] banners: {} already added'.format(thumb))
                 if thumb_channel and thumb_channel not in metadata.posters:
                   Log('[X] posters:   {}'.format(thumb_channel))
                   metadata.posters [thumb_channel] = Proxy.Media(HTTP.Request(thumb_channel).content, sort_order=1 if Prefs['media_poster_source']=='Channel' else 2)
@@ -1066,15 +1180,33 @@ def Update(metadata, media, lang, force, movie):
                 else:                                                        Log('[ ] posters:   {}'.format(thumb_channel))
         
         ### Cast comes from channel
-        else:    
-          thumb         = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvLowImageUrl' ) or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvMediumImageUrl') \
-                       or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvHighImageUrl') or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvImageUrl'      )
-          external_banner_url = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerExternalUrl')
-          if not thumb and external_banner_url: thumb = '{}=s1920'.format(external_banner_url)
-          if thumb and thumb not in metadata.art:      Log(u'[X] art:       {}'.format(thumb));  metadata.art [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
-          else:                                        Log(u'[ ] art:       {}'.format(thumb))
-          if thumb and thumb not in metadata.banners:  Log(u'[X] banners:   {}'.format(thumb));  metadata.banners [thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
-          else:                                        Log(u'[ ] banners:   {}'.format(thumb))
+        else:
+          # ====== ART/BANNERS: Priorität: 1. fanart.jpg, 2. Channel Banner ======
+          fanart_path, fanart_data = img_load_series(dir, 'fanart')
+          if fanart_path and fanart_data:
+            # Lokales Fanart gefunden (höchste Priorität)
+            if fanart_path not in metadata.art:
+              metadata.art[fanart_path] = Proxy.Media(fanart_data, sort_order=1)
+              Log.Info(u'[X] art: LOCAL {} (sort_order=1)'.format(os.path.basename(fanart_path)))
+            if fanart_path not in metadata.banners:
+              metadata.banners[fanart_path] = Proxy.Media(fanart_data, sort_order=1)
+              Log.Info(u'[X] banners: LOCAL {} (sort_order=1)'.format(os.path.basename(fanart_path)))
+          else:
+            # Fallback: Channel Banner von API
+            thumb = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvLowImageUrl' ) or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvMediumImageUrl') \
+                         or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvHighImageUrl') or Dict(json_channel_details, 'brandingSettings', 'image', 'bannerTvImageUrl'      )
+            external_banner_url = Dict(json_channel_details, 'brandingSettings', 'image', 'bannerExternalUrl')
+            if not thumb and external_banner_url: thumb = '{}=s1920'.format(external_banner_url)
+            if thumb and thumb not in metadata.art:
+              metadata.art[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+              Log.Info(u'[X] art: Channel banner from API')
+            elif thumb:
+              Log.Info(u'[ ] art: {} already added'.format(thumb))
+            if thumb and thumb not in metadata.banners:
+              metadata.banners[thumb] = Proxy.Media(HTTP.Request(thumb).content, sort_order=1)
+              Log.Info(u'[X] banners: Channel banner from API')
+            elif thumb:
+              Log.Info(u'[ ] banners: {} already added'.format(thumb))
           thumb_channel = Dict(json_channel_details, 'snippet', 'thumbnails', 'medium', 'url') or Dict(json_channel_details, 'snippet', 'thumbnails', 'high', 'url')   or Dict(json_channel_details, 'snippet', 'thumbnails', 'default', 'url')
           if thumb_channel and thumb_channel not in metadata.posters:
             #thumb_channel = sanitize_path(thumb_channel)
@@ -1084,8 +1216,9 @@ def Update(metadata, media, lang, force, movie):
           else:                                        Log('[ ] posters:   {}'.format(thumb_channel))
           metadata.roles.clear()
           role       = metadata.roles.new()
-          role.role  = xml_safe(sanitize_path(Dict(json_channel_details, 'snippet', 'title')))  # XML-SAFE
-          role.name  = xml_safe(sanitize_path(Dict(json_channel_details, 'snippet', 'title')))  # XML-SAFE
+          # FIX: sanitize_path() NICHT für Display-Namen verwenden!
+          role.role  = xml_safe(Dict(json_channel_details, 'snippet', 'title'))  # XML-SAFE
+          role.name  = xml_safe(Dict(json_channel_details, 'snippet', 'title'))  # XML-SAFE
           role.photo = thumb_channel
           Log.Info(u'[ ] role:        {}'.format(Dict(json_channel_details,'snippet','title')))
           #if not Dict(json_playlist_details, 'snippet', 'publishedAt'):  metadata.originally_available_at = Datetime.ParseDate(Dict(json_channel_items, 'snippet', 'publishedAt')).date();  Log.Info('[ ] publishedAt:  {}'.format(Dict(json_channel_items, 'snippet', 'publishedAt' )))
@@ -1099,10 +1232,10 @@ def Update(metadata, media, lang, force, movie):
       # KORREKTUR: Channel-ID aus Ordnername extrahieren - verwende 'dir'
       folder_name = os.path.basename(dir)
       Log.Info('Analysiere Ordnername fuer Channel-ID: "{}"'.format(folder_name))
-      
+
       # KORREKTUR: Entferne alle YouTube-IDs aus Seriennamen
       clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9_-]{16,32}\]', '', folder_name).strip()
-      metadata.title = xml_safe(clean_title)  # XML-SAFE
+      metadata.title = sanitize_path(clean_title)
       Log.Info('Bereinigte Serie-Titel gesetzt: "{}"'.format(clean_title))
       
       # Regex um Channel-ID aus Ordnername zu extrahieren: [UCxxxxxxxx]
@@ -1221,7 +1354,7 @@ def Update(metadata, media, lang, force, movie):
             # Fallback: Ordnername ohne YouTube-IDs
             folder_name = os.path.basename(dir)
             clean_title = re.sub(r'\[(UC|PL|UU|FL|LP|RD|HC)[a-zA-Z0-9\-_]{16,32}\]', '', folder_name).strip()
-            metadata.title = xml_safe(clean_title if clean_title else folder_name)  # XML-SAFE
+            metadata.title = sanitize_path(clean_title if clean_title else folder_name)
             Log.Info(u'[ ] Serientitel aus Ordnername gesetzt: "{}"'.format(metadata.title))
     else:
         Log.Info(u'[ ] DEBUG: Bedingung NICHT erfüllt - überspringe JSON-Extraktion')
